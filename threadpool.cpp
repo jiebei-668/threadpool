@@ -79,9 +79,15 @@ void ThreadPool::init(int init_thread_num)
 		pthread_create(&this->threadIDs[i+1], NULL, work, (void *)this);
 	}
 }
+void ThreadPool::cleanup()
+{
+	pthread_mutex_unlock();
+	return;
+}
 void* ThreadPool::manage(void* arg)
 {
 	ThreadPool *pool = (ThreadPool *)arg;
+	pthread_cleanup_push(pool->cleanup, NULL);
 	while(!pool->shutdown)
 	{
 		// 每5s管理一次
@@ -120,11 +126,13 @@ void* ThreadPool::manage(void* arg)
 		}
 		pthread_mutex_unlock(&pool->mutex);
 	}
+	pthread_cleanup_pop(1);
 	return NULL;
 }
 void* ThreadPool::work(void* arg)
 {
 	ThreadPool *pool = (ThreadPool *)arg;
+	pthread_cleanup_push(pool->cleanup, NULL);
 	// 锁住线程从任务队列获取一个任务或者自杀	
 	pthread_mutex_lock(&pool->mutex);
 
@@ -162,6 +170,7 @@ void* ThreadPool::work(void* arg)
 	pool->busyNum--;
 	pool->liveNum--;
 	pthread_mutex_unlock(&pool->mutex);
+	pthread_cleanup_pop(1);
 	return NULL;
 }
 void ThreadPool::threadExit()

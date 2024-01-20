@@ -50,6 +50,9 @@ public:
 	// 当线程池要销毁时，置为true
 	bool shutdown;
 	void init(int init_thread_num);
+	// 如果线程在等待条件变量时被取消（pthread_cancel），会有bug，互斥锁还不了
+	// 需要在线程清理函数完成这个释放互斥锁的工作，并在使用条件变量的函数中注册线程清理函数
+	void cleanup();
 	static void* manage(void*);
 	static void* work(void*);
 	void threadExit();
