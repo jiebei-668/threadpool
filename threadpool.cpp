@@ -35,7 +35,11 @@ TaskQueue::~TaskQueue()
 {
 	for(auto one: this->dq)
 	{
-		free(one.arg);
+		if(one.arg != NULL)
+		{
+			free(one.arg);
+			one.arg = NULL;
+		}
 	}
 
 }
@@ -43,6 +47,8 @@ TaskQueue::~TaskQueue()
 
 
 
+// 向任务队列插入任务
+// @param: 任务函数funtion 任务函数的参数arg
 void ThreadPool::insertTask(void (*funtion)(void *), void *arg)
 {
 	pthread_mutex_lock(&this->mutex);
@@ -51,67 +57,95 @@ void ThreadPool::insertTask(void (*funtion)(void *), void *arg)
 		pthread_cond_wait(&this->notFull, &this->mutex);
 	}
 	this->taskQ.insertTask(funtion, arg);
-	pthread_cond_signal(&this->notEmpty);
+	pthread_cond_broadcast(&this->notEmpty);
 	printf("add one task... there're %d task waiting...\n", this->taskQ.getTaskQueueNum());
 	pthread_mutex_unlock(&this->mutex);
 	return;
 }
-void ThreadPool::init(int init_thread_num)
+// 初始化线程池，启动一个管理者线程和若干个工作线程
+// @param: 初始工作线程数量
+void ThreadPool::init(int init_work_thread_num)
 {
 	this->shutdown = false;
 	// 初始化相关成员变量
 	if( pthread_mutex_init(&this->mutex, NULL) || pthread_cond_init(&this->notFull, NULL) || pthread_cond_init(&this->notEmpty, NULL))
 	{
-		printf("ThreadPool::init() failed! mutex or cond init failed!\n");
+		printf("ThreadPool::init() failed! Mutex or cond init() failed!\n");
+		// 这里其实不合适调用析构函数，因为mutex和cond未初始化成功，析构函数里会拿到mutex以及销毁cond，这可能有问题
 		this->~ThreadPool();
-		return;
+		exit(-1);
 	}
 	this->changeNum = 2;
-	this->liveNum = min(init_thread_num, minThreadNum);
-	this->liveNum = min(this->liveNum, maxThreadNum);
+	if(init_work_thread_num < minWorkThreadNum)
+	{
+		this->liveNum = minWorkThreadNum;
+	}
+	else if(init_work_thread_num > maxWorkThreadNum)
+	{
+		this->liveNum = maxWorkThreadNum;
+	}
+	else
+	{
+		this->liveNum = init_work_thread_num;
+	}
 	this->busyNum = 0;
 	this->exitNum = 0;
-	this->threadIDs.resize(this->maxThreadNum+1, 0);
-	// 启动一个管理者线程和 inin_thread_num 个工作线程
+	this->threadIDs.resize(this->maxWorkThreadNum+1, 0);
+	// 启动一个管理者线程和 liveNum 个工作线程
 	pthread_create(&this->threadIDs[0], NULL, manage, (void *)this);
 	for(int i = 0; i < this->liveNum; i++)
 	{
 		pthread_create(&this->threadIDs[i+1], NULL, work, (void *)this);
 	}
 }
-void ThreadPool::cleanup()
+// 工作线程的线程清理函数
+// 如果线程在等待条件变量时被取消（pthread_cancel），会有bug，互斥锁还不了
+// 需要在线程清理函数完成这个释放互斥锁的工作，并在使用条件变量的函数中注册线程清理函数
+// 释放mutex，防止取消有等待条件变量的线程时无法退出
+// 注：应该将工作线程函数的参数释放掉，怎么实现？
+// @param 强转为void *类型的ThreadPool *类型参数
+void ThreadPool::worker_cleanup(void *arg)
 {
-	pthread_mutex_unlock();
+	ThreadPool *pool = (ThreadPool *)arg;	
+	pthread_mutex_unlock(&pool->mutex);
+	printf("worker[%ld] exit...\n", pthread_self());
 	return;
 }
+// 管理者线程函数
+// 每5s管理一次，如果shutdown==true就退出
+	// 当没有空闲工作线程busynum==livenum且任务数量大于0时，增加changeNum个新工作线程pool
+// 当空闲工作线程超过6 busyNum+6 <= liveNum-exitNum，杀死changeNum个工作线程
+// @param: 强转为void *类型的ThreadPool *类型的参数，指向线程池对象
 void* ThreadPool::manage(void* arg)
 {
 	ThreadPool *pool = (ThreadPool *)arg;
-	pthread_cleanup_push(pool->cleanup, NULL);
+	pthread_cleanup_push(pool->manager_cleanup, arg);
+	// 分离线程，在退出时不必被join
+	pthread_detach(pthread_self());
 	while(!pool->shutdown)
 	{
 		// 每5s管理一次
-		sleep(5);
 		printf("manage...\n");
-
+		sleep(5);
 
 		// 当没有空闲线程busynum==livenum且任务数量大于5时，增加changeNum个新线程pool
 		pthread_mutex_lock(&pool->mutex);
-		if(pool->busyNum == pool->liveNum && pool->taskQ.getTaskQueueNum() >= 5)
+		if(pool->busyNum == pool->liveNum && pool->taskQ.getTaskQueueNum() > 0)
 		{
-			for(int i = 0; i < pool->changeNum && pool->liveNum < pool->maxThreadNum; i++)
+			for(int i = 0; i < pool->changeNum && pool->liveNum < pool->maxWorkThreadNum; i++)
 			{
 				int pos = -1;
 				// 位置0放管理者线程id
 				for(int j = 1; j < pool->threadIDs.size(); j++)
 				{
-					if(pool->threadIDs[j] != 0) 
+					if(pool->threadIDs[j] == 0) 
 					{
 						pos = j;
 						break;
 					}
 				}
-				pthread_create(&pool->threadIDs[pos], NULL, pool->work, pool);
+				pthread_create(&pool->threadIDs[pos], NULL, pool->work, arg);
+				printf("add a new worker thread[%ld]...\n", pool->threadIDs[pos]);
 				pool->liveNum++;
 			}
 		}
@@ -129,10 +163,29 @@ void* ThreadPool::manage(void* arg)
 	pthread_cleanup_pop(1);
 	return NULL;
 }
+// 管理者线程退出时的清理函数
+// 释放mutex，防止取消有等待条件变量的线程时无法退出
+// 需要对任务队列中的堆内存进行释放
+void ThreadPool::manager_cleanup(void *arg)
+{
+	ThreadPool *pool = (ThreadPool *)arg;
+	pthread_mutex_unlock(&pool->mutex);
+	for(auto &task: pool->taskQ.dq)
+	{
+		if(task.arg != NULL)
+		{
+			free(task.arg);
+			task.arg = NULL;
+		}
+	}
+	printf("manager exit...\n");
+}
 void* ThreadPool::work(void* arg)
 {
 	ThreadPool *pool = (ThreadPool *)arg;
-	pthread_cleanup_push(pool->cleanup, NULL);
+	pthread_cleanup_push(pool->worker_cleanup, arg);
+	// 分离线程，在退出时不必被join
+	pthread_detach(pthread_self());
 	// 锁住线程从任务队列获取一个任务或者自杀	
 	pthread_mutex_lock(&pool->mutex);
 
@@ -146,38 +199,45 @@ void* ThreadPool::work(void* arg)
 		printf("thread[%ld] is killed by manager...\n", pthread_self());
 		pool->exitNum--;
 		// 在当前条件下一定满足这个条件
-		if(pool->liveNum > pool->minThreadNum)
+		if(pool->liveNum > pool->minWorkThreadNum)
 		{
 			pool->liveNum--;
 			pthread_mutex_unlock(&pool->mutex);
 			pool->threadExit();
 		}
 	}
+	// 当线程池关闭时，需要清除所有工作线程
 	if(pool->shutdown)
 	{
-			pthread_mutex_unlock(&pool->mutex);
+		pthread_mutex_unlock(&pool->mutex);
 		pool->threadExit();
 	}
 	auto task = pool->taskQ.getTask();
 	pool->busyNum++;
 	printf("one task consumed[%ld]... there're %d task waiting\n", pthread_self(), pool->taskQ.getTaskQueueNum());
-	pthread_cond_signal(&pool->notFull);
+	pthread_cond_broadcast(&pool->notFull);
 	pthread_mutex_unlock(&pool->mutex);
 	task.funtion(task.arg);
 	// 参数规定动态分配，运行完free
-	free(task.arg);
+	if(task.arg != NULL)
+	{
+		free(task.arg);
+		task.arg = NULL;
+	}
 	pthread_mutex_lock(&pool->mutex);
 	pool->busyNum--;
 	pool->liveNum--;
 	pthread_mutex_unlock(&pool->mutex);
+	pool->threadExit();
 	pthread_cleanup_pop(1);
 	return NULL;
 }
+// 线程退出时将自己的线程id从threadIDs中去除（清零）
 void ThreadPool::threadExit()
 {
 	pthread_mutex_lock(&this->mutex);
 	pthread_t id = pthread_self();
-	for(int i = 1; i < this->maxThreadNum+1; i++)
+	for(int i = 1; i < this->maxWorkThreadNum+1; i++)
 	{
 		if(id == this->threadIDs[i]) 
 		{
@@ -190,18 +250,30 @@ void ThreadPool::threadExit()
 }
 ThreadPool::ThreadPool()
 {
+	liveNum = 0;
+	busyNum = 0;
+	exitNum = 0;
+	shutdown = true;
 }
 ThreadPool::~ThreadPool()
 {
 	printf("threadpool is exiting...\n");
-	pthread_mutex_lock(&this->mutex);
-	this->shutdown = true;
-	// 设置退出标志，并唤醒所有等待notEmpty的线程，让其退出
-	pthread_cond_broadcast(&this->notEmpty);
-	pthread_mutex_unlock(&this->mutex);
+	//pthread_mutex_lock(&this->mutex);
+	//this->shutdown = true;
+	//// 设置退出标志，并唤醒所有等待notEmpty的线程，让其退出
+	//pthread_cond_broadcast(&this->notEmpty);
+	//pthread_mutex_unlock(&this->mutex);
+	// 直接取消全部管理者和工作者线程
+	for(auto &id: threadIDs)
+	{
+		if(id != 0)
+		{
+			pthread_cancel(id);
+			id = 0;
+		}
+	}
 	// 睡眠一段时间保证全部退出
-	sleep(30);
-	pthread_join(this->threadIDs[0], NULL);
+	sleep(5);
 	pthread_mutex_destroy(&this->mutex);
 	pthread_cond_destroy(&this->notFull);
 	pthread_cond_destroy(&this->notEmpty);
